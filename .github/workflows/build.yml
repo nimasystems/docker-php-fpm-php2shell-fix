@@ -12,7 +12,6 @@ on:
 
 env:
   IMAGE: registry.nimahosts.com/nimasystems-public/php-fpm
-  PHP_VERSION: "7.3"
 
 jobs:
   set-version:
@@ -38,21 +37,25 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   # PHP is compiled from source, so each platform builds on a native runner
-  # (no QEMU) and pushes by digest; merge-push stitches the manifest list.
+  # (no QEMU) and pushes by digest; merge-push stitches the manifest lists.
   build:
     needs: [ set-version ]
     strategy:
       fail-fast: true
       matrix:
+        php: [ "7.3", "7.4" ]
+        platform: [ linux/amd64, linux/arm64 ]
         include:
           - platform: linux/amd64
             runner: ubuntu-24.04
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    env:
+      PHP_VERSION: ${{ matrix.php }}
     steps:
       - name: Prepare
-        run: echo "PLATFORM_PAIR=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_ENV"
+        run: echo "PLATFORM_PAIR=${{ matrix.php }}-${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -100,9 +103,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: [ set-version, build ]
     if: ${{ !cancelled() }}
-    outputs:
-      version: ${{ needs.set-version.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        php: [ "7.3", "7.4" ]
     env:
+      PHP_VERSION: ${{ matrix.php }}
       VERSION: ${{ needs.set-version.outputs.version }}
     steps:
       - name: Check platform builds
@@ -115,7 +121,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: /tmp/digests
-          pattern: digests-*
+          pattern: digests-${{ matrix.php }}-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -189,7 +195,7 @@ jobs:
                   *Build URL:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Build>"
 
   create-release:
-    needs: [ merge-push ]
+    needs: [ set-version, merge-push ]
     runs-on: ubuntu-latest
     if: ${{ needs.merge-push.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     permissions:
@@ -204,14 +210,14 @@ jobs:
         id: changelog
         run: |
           # Get previous tag
-          PREVIOUS_TAG=$(git describe --tags --abbrev=0 v${{ needs.merge-push.outputs.version }}^ 2>/dev/null || echo "")
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 v${{ needs.set-version.outputs.version }}^ 2>/dev/null || echo "")
 
           if [ -z "$PREVIOUS_TAG" ]; then
             echo "No previous tag found, using the last 20 commits"
-            CHANGELOG=$(git log -n 20 --pretty=format:"- %s (%h)" v${{ needs.merge-push.outputs.version }})
+            CHANGELOG=$(git log -n 20 --pretty=format:"- %s (%h)" v${{ needs.set-version.outputs.version }})
           else
             echo "Previous tag: $PREVIOUS_TAG"
-            CHANGELOG=$(git log --pretty=format:"- %s (%h)" ${PREVIOUS_TAG}..v${{ needs.merge-push.outputs.version }})
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" ${PREVIOUS_TAG}..v${{ needs.set-version.outputs.version }})
           fi
 
           # Save changelog to file for multiline output
@@ -232,13 +238,13 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: v${{ needs.merge-push.outputs.version }}
-          name: Release ${{ needs.merge-push.outputs.version }}
+          tag_name: v${{ needs.set-version.outputs.version }}
+          name: Release ${{ needs.set-version.outputs.version }}
           body: |
-            ## PHP-FPM ${{ env.PHP_VERSION }}-prod (PHP2Shell fix) Release ${{ needs.merge-push.outputs.version }}
+            ## PHP-FPM 7.3-prod / 7.4-prod (PHP2Shell fix) Release ${{ needs.set-version.outputs.version }}
 
-            `devilbox/php-fpm:${{ env.PHP_VERSION }}-prod` with PHP rebuilt from patched sources to fix
-            CVE-2026-109618 and CVE-2026-109619 (PHP2Shell).
+            `devilbox/php-fpm:7.3-prod` and `devilbox/php-fpm:7.4-prod` with PHP rebuilt from patched
+            sources to fix CVE-2026-109618 and CVE-2026-109619 (PHP2Shell).
 
             **Platforms:** Docker (linux/amd64, linux/arm64)
 
@@ -246,8 +252,8 @@ jobs:
             ${{ steps.changelog.outputs.content }}
 
             ### Docker Images
-            - `${{ env.IMAGE }}:${{ env.PHP_VERSION }}-prod-${{ needs.merge-push.outputs.version }}`
-            - `${{ env.IMAGE }}:${{ env.PHP_VERSION }}-prod`
+            - `${{ env.IMAGE }}:7.3-prod-${{ needs.set-version.outputs.version }}` / `${{ env.IMAGE }}:7.3-prod`
+            - `${{ env.IMAGE }}:7.4-prod-${{ needs.set-version.outputs.version }}` / `${{ env.IMAGE }}:7.4-prod`
 
             ### Deployment
             This release has been automatically built and pushed to the Docker registry.

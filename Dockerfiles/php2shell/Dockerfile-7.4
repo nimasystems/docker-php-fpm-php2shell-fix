@@ -1,0 +1,120 @@
+# vi: ft=dockerfile
+#
+# devilbox/php-fpm:7.4-prod with PHP rebuilt from patched sources to fix
+# PHP2Shell (CVE-2026-109618 / CVE-2026-109619).
+#
+# PHP 7.4 is EOL and gets no upstream release with the fix, so PHP 7.4.33 is
+# recompiled in place with the official PHP 7.4 source backport, unmodified
+# (see ./patches/7.4). Everything else in the upstream image (extensions,
+# tools, entrypoint, supervisor) is kept as is.
+
+# Upstream devilbox/php-fpm:7.4-prod (last built 2023-01-30), pinned by digest
+ARG BASE_IMAGE=devilbox/php-fpm:7.4-prod@sha256:9b43a71e4efcaf1fad9483fdd42b29d207e6c8d11da3baec5ba71bb2b8b0a3db
+
+
+###
+### Build patched PHP
+###
+FROM ${BASE_IMAGE} AS builder
+
+COPY ./patches/7.4/ /usr/src/php-patches/
+
+# Bullseye is EOL and its mirrors no longer serve the old pool, so take the
+# headers from snapshot.debian.org: the base image (2022-11) and the devilbox
+# build (2023-01). Every -dev package is pinned to the version of the runtime
+# library installed in the image, so PHP links against exactly what ships.
+RUN set -eux \
+	&& { \
+		for s in 20221114T000000Z 20230130T000000Z; do \
+			echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${s} bullseye main"; \
+			echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${s} bullseye-updates main"; \
+			echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${s} bullseye-security main"; \
+		done; \
+	} > /etc/apt/sources.list \
+	&& rm -f /etc/apt/sources.list.d/*.list \
+	&& DEV_PKGS="" \
+	&& for pair in \
+		libargon2-dev:libargon2-1 \
+		libcurl4-openssl-dev:libcurl4 \
+		libonig-dev:libonig5 \
+		libreadline-dev:libreadline8 \
+		libsodium-dev:libsodium23 \
+		libsqlite3-dev:libsqlite3-0 \
+		libssl-dev:libssl1.1 \
+		libxml2-dev:libxml2 \
+		zlib1g-dev:zlib1g \
+	; do \
+		DEV_PKGS="${DEV_PKGS} ${pair%%:*}=$( dpkg-query -W -f='${Version}' "${pair#*:}" )"; \
+	done \
+	&& DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 update \
+	&& DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends --no-install-suggests --no-upgrade \
+		${PHPIZE_DEPS} \
+		patch \
+		xz-utils \
+		${DEV_PKGS} \
+	\
+# Unpack the pristine sources shipped with the image and patch them
+	&& PHP_SRC_VERSION="$( php -r 'echo PHP_VERSION;' )" \
+	&& mkdir -p "/usr/src/php-${PHP_SRC_VERSION}" \
+	&& tar -Jxf /usr/src/php.tar.xz -C "/usr/src/php-${PHP_SRC_VERSION}" --strip-components=1 \
+	&& cd "/usr/src/php-${PHP_SRC_VERSION}" \
+	&& for p in /usr/src/php-patches/*.patch; do patch -p1 --forward --fuzz=0 < "${p}"; done \
+	\
+# Repack, so docker-php-ext-install builds against the patched sources too
+	&& tar -C /usr/src -cJf /usr/src/php-patched.tar.xz "php-${PHP_SRC_VERSION}" \
+	\
+# Configure exactly like the original build
+	&& export CFLAGS="${PHP_CFLAGS}" CPPFLAGS="${PHP_CPPFLAGS}" LDFLAGS="${PHP_LDFLAGS}" \
+	&& ./configure $( php-config --configure-options ) \
+	&& make -j"$( nproc )" \
+	&& find . -type f -name '*.a' -delete \
+	\
+# Install everything except PEAR (keeps the pecl registry of the image intact)
+	&& INSTALL_TARGETS="$( sed -n 's/^install_targets = //p' Makefile | sed 's/install-pear//' )" \
+	&& make INSTALL_ROOT=/php-install ${INSTALL_TARGETS} \
+	&& rm -rf /php-install/usr/local/etc /php-install/usr/local/php/man \
+	&& find /php-install/usr/local -type f -exec sh -c 'file -b "$1" | grep -q "^ELF" && strip --strip-all "$1" || true' _ '{}' \; \
+	&& test -x /php-install/usr/local/bin/php \
+	&& test -x /php-install/usr/local/sbin/php-fpm
+
+
+###
+### Final image
+###
+FROM ${BASE_IMAGE}
+
+LABEL "org.opencontainers.image.url"="https://github.com/nimasystems/docker-php-fpm-php2shell-fix"
+LABEL "org.opencontainers.image.source"="https://github.com/nimasystems/docker-php-fpm-php2shell-fix"
+LABEL "org.opencontainers.image.vendor"="nimasystems"
+LABEL "org.opencontainers.image.ref.name"="7.4-prod"
+LABEL "org.opencontainers.image.title"="PHP-FPM 7.4-prod (PHP2Shell fix)"
+LABEL "org.opencontainers.image.description"="devilbox/php-fpm:7.4-prod with PHP 7.4.33 patched for CVE-2026-109618 and CVE-2026-109619"
+
+COPY --from=builder /php-install/usr/local/ /usr/local/
+COPY --from=builder /usr/src/php-patched.tar.xz /usr/src/php.tar.xz
+COPY --from=builder /usr/src/php-patches/ /usr/src/php-patches/
+COPY ./data/php-ini.d/php2shell.ini /usr/local/etc/php/conf.d/xxx-php2shell.ini
+
+###
+### Verify
+###
+RUN set -eux \
+# The signature belongs to the unpatched tarball
+	&& rm -f /usr/src/php.tar.xz.asc \
+	\
+# max_multipart_body_parts only exists in the patched build
+	&& php -r 'exit(ini_get("max_multipart_body_parts") === "-1" ? 0 : 1);' \
+	&& php -r 'exit(ini_get("session.upload_progress.enabled") ? 1 : 0);' \
+	&& php -v | grep -oE 'PHP\s[.0-9]+' | grep -oE '[.0-9]+' | grep '^7.4' \
+	\
+	&& echo "date.timezone=UTC" > /usr/local/etc/php/php.ini \
+	&& /usr/local/sbin/php-fpm --test \
+	&& PHP_ERROR="$( php -v 2>&1 1>/dev/null )" \
+	&& if [ -n "${PHP_ERROR}" ]; then echo "${PHP_ERROR}"; false; fi \
+	&& PHP_ERROR="$( php -i 2>&1 1>/dev/null )" \
+	&& if [ -n "${PHP_ERROR}" ]; then echo "${PHP_ERROR}"; false; fi \
+	&& PHP_FPM_ERROR="$( php-fpm -v 2>&1 1>/dev/null )" \
+	&& if [ -n "${PHP_FPM_ERROR}" ]; then echo "${PHP_FPM_ERROR}"; false; fi \
+	&& PHP_FPM_ERROR="$( php-fpm -i 2>&1 1>/dev/null )" \
+	&& if [ -n "${PHP_FPM_ERROR}" ]; then echo "${PHP_FPM_ERROR}"; false; fi \
+	&& rm -f /usr/local/etc/php/php.ini

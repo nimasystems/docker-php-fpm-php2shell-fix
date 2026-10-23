@@ -5,8 +5,9 @@
 #
 # PHP 7.3 is EOL and gets no upstream release with the fix, so PHP 7.3.33 is
 # recompiled in place with the official PHP 7.4 source backport ported to 7.3
-# (see ./patches). Everything else in the upstream image (extensions, tools,
-# entrypoint, supervisor) is kept as is.
+# (see ./patches/7.3). Everything else in the upstream image (extensions,
+# tools, entrypoint, supervisor) is kept as is.
+
 # Upstream devilbox/php-fpm:7.3-prod (last built 2023-01-30), pinned by digest
 ARG BASE_IMAGE=devilbox/php-fpm:7.3-prod@sha256:c6a290eaa53137c575b8eb2b9723068b51c71ccad895128629b8be1e6c483bf7
 
@@ -16,7 +17,7 @@ ARG BASE_IMAGE=devilbox/php-fpm:7.3-prod@sha256:c6a290eaa53137c575b8eb2b9723068b
 ###
 FROM ${BASE_IMAGE} AS builder
 
-COPY ./patches/ /usr/src/php-patches/
+COPY ./patches/7.3/ /usr/src/php-patches/
 
 # Bullseye is EOL and its mirrors no longer serve the old pool, so take the
 # headers from snapshot.debian.org: the base image (2022-03) and the devilbox

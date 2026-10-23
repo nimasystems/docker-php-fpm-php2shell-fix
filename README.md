@@ -1,14 +1,20 @@
-# PHP-FPM 7.3-prod with the PHP2Shell fix (nimasystems fork)
+# PHP-FPM 7.3-prod / 7.4-prod with the PHP2Shell fix (nimasystems fork)
 
-This fork publishes `devilbox/php-fpm:7.3-prod` with PHP **7.3.33** rebuilt from patched sources to fix
-**PHP2Shell**: [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
+This fork publishes `devilbox/php-fpm:7.3-prod` and `devilbox/php-fpm:7.4-prod` with PHP rebuilt from patched
+sources to fix **PHP2Shell**: [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
 (RCE via OOM corruption) and [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
 (RCE via stale global state), both CVSS 9.2.
 
-PHP 7.3 is end of life and has no official release with the fix. The patch in
-[`Dockerfiles/php2shell/patches/`](Dockerfiles/php2shell/patches/) ports the PHP security team's minimal
-backport for EOL branches ([`PHP-7.4-CVE-2026-109618-109619`](https://github.com/php/php-src/tree/PHP-7.4-CVE-2026-109618-109619),
-commit `712e60f9edfd`) to 7.3.33. It:
+PHP 7.3 and 7.4 are end of life and have no official release with the fix. The PHP security team published a
+minimal source backport for EOL branches ([`PHP-7.4-CVE-2026-109618-109619`](https://github.com/php/php-src/tree/PHP-7.4-CVE-2026-109618-109619),
+commit `712e60f9edfd`):
+
+| Image      | PHP    | Patch |
+|------------|--------|-------|
+| `7.4-prod` | 7.4.33 | [official backport, unmodified](Dockerfiles/php2shell/patches/7.4/) |
+| `7.3-prod` | 7.3.33 | [official backport ported to 7.3](Dockerfiles/php2shell/patches/7.3/) (differences listed in the patch header) |
+
+The patch:
 
 - replaces the `longjmp()` bailout on memory-limit / allocation-overflow errors with an immediate `_exit()` of the worker, so request shutdown never runs on half-initialized state
 - resets error, exception, object-store, HTTP globals, SAPI and session state at request shutdown so nothing stale is visible to the next request
@@ -19,30 +25,32 @@ Behavior change: a request that hits `memory_limit` now terminates its FPM worke
 The `Fatal error: Allowed memory size ... exhausted` message is written to the worker's stderr (it shows up in the
 FPM log) instead of going through the PHP error handlers, and the web server answers with a 502 instead of a 500.
 
-### Image
+### Images
 
 ```bash
 docker pull registry.nimahosts.com/nimasystems-public/php-fpm:7.3-prod
+docker pull registry.nimahosts.com/nimasystems-public/php-fpm:7.4-prod
 ```
 
-It is a drop-in replacement for `devilbox/php-fpm:7.3-prod`: the upstream image (pinned by digest) is kept as is,
-only the PHP binaries, headers and bundled shared modules (`opcache`, `sodium`) are replaced, and
+Each is a drop-in replacement for the matching `devilbox/php-fpm` image: the upstream image (pinned by digest) is
+kept as is, only the PHP binaries, headers and bundled shared modules (`opcache`, `sodium`) are replaced, and
 `/usr/src/php.tar.xz` holds the patched sources so `docker-php-ext-install` builds against them.
 The build fails if the patched PHP is not active.
 
-Limitation: PECL and other extensions in the upstream image were compiled against the unpatched headers and are not
+Limitation: PECL and other extensions in the upstream images were compiled against the unpatched headers and are not
 rebuilt. The fix itself is in the PHP core binaries; only the overflow checks that PHP's headers inline into those
 extensions keep the old behavior.
 
 ### Build and release
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) builds `linux/amd64` and `linux/arm64` on native
-runners, pushes to `registry.nimahosts.com`, sends a Slack notification and creates a GitHub release.
+[`.github/workflows/build.yml`](.github/workflows/build.yml) builds both PHP versions for `linux/amd64` and
+`linux/arm64` on native runners, pushes to `registry.nimahosts.com`, sends a Slack notification per image and
+creates a GitHub release.
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
-# -> registry.nimahosts.com/nimasystems-public/php-fpm:7.3-prod-1.0.0 and :7.3-prod
+git tag v1.1.0
+git push origin v1.1.0
+# -> registry.nimahosts.com/nimasystems-public/php-fpm:7.3-prod-1.1.0, :7.3-prod, :7.4-prod-1.1.0 and :7.4-prod
 ```
 
 Or run the workflow manually (Actions -> build -> Run workflow) with a version.
@@ -51,7 +59,7 @@ Required repository secrets: `REGISTRY_NIMAHOSTS_USERNAME`, `REGISTRY_NIMAHOSTS_
 Local build:
 
 ```bash
-docker build -t php-fpm:7.3-prod-php2shell -f Dockerfiles/php2shell/Dockerfile-7.3 Dockerfiles/php2shell
+docker build -t php-fpm:7.4-prod-php2shell -f Dockerfiles/php2shell/Dockerfile-7.4 Dockerfiles/php2shell
 ```
 
 The upstream README follows.
