@@ -1,6 +1,7 @@
-# PHP-FPM 7.3-prod / 7.4-prod / 8.2-prod with the PHP2Shell fix (nimasystems fork)
+# PHP2Shell-fixed PHP images: php-fpm 7.3-prod / 7.4-prod / 8.2-prod and php 7.3-apache (nimasystems fork)
 
-This fork publishes `devilbox/php-fpm` 7.3-prod, 7.4-prod and 8.2-prod with PHP rebuilt to fix **PHP2Shell**: [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
+This fork publishes `devilbox/php-fpm` 7.3-prod, 7.4-prod and 8.2-prod and the official `php:7.3-apache` with PHP
+rebuilt to fix **PHP2Shell**: [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
 (RCE via OOM corruption) and [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
 (RCE via stale global state), both CVSS 9.2.
 
@@ -14,6 +15,7 @@ commit `712e60f9edfd`):
 | `7.4-prod` | 7.4.33 | [official backport, unmodified](Dockerfiles/php2shell/patches/7.4/) |
 | `7.3-prod` | 7.3.33 | [official backport ported to 7.3](Dockerfiles/php2shell/patches/7.3/) (differences listed in the patch header) |
 | `8.2-prod` | 8.2.35 | official release (upgraded from 8.2.1), checksum pinned in [`Dockerfile-8.2`](Dockerfiles/php2shell/Dockerfile-8.2) |
+| `php:7.3-apache` | 7.3.33 | same 7.3 patch, built as the Apache module (`libphp7.so`, mod_php) and CLI ([`Dockerfile-7.3-apache`](Dockerfiles/php2shell/Dockerfile-7.3-apache)) |
 
 The 7.3 / 7.4 patch (8.2.35 contains the complete upstream fix, which handles OOM gracefully instead):
 
@@ -22,9 +24,11 @@ The 7.3 / 7.4 patch (8.2.35 contains the complete upstream fix, which handles OO
 - limits multipart parsing (`max_multipart_body_parts`, default `max_input_vars + max_file_uploads`; only `Content-Disposition`/`Content-Type` part headers are kept)
 - disables the session upload progress hook (`session.upload_progress.enabled` is also set to `Off`)
 
-Behavior change (7.3 / 7.4 only): a request that hits `memory_limit` now terminates its FPM worker (the master spawns a new one).
+Behavior change (7.3 / 7.4 only): a request that hits `memory_limit` now terminates its FPM worker or Apache child
+(the master / Apache parent spawns a new one).
 The `Fatal error: Allowed memory size ... exhausted` message is written to the worker's stderr (it shows up in the
-FPM log) instead of going through the PHP error handlers, and the web server answers with a 502 instead of a 500.
+FPM or Apache error log) instead of going through the PHP error handlers, and the client gets a dropped connection
+(a 502 behind a proxy) instead of a 500.
 
 ### Images
 
@@ -32,9 +36,10 @@ FPM log) instead of going through the PHP error handlers, and the web server ans
 docker pull registry.nimahosts.com/nimasystems-public/php-fpm:7.3-prod
 docker pull registry.nimahosts.com/nimasystems-public/php-fpm:7.4-prod
 docker pull registry.nimahosts.com/nimasystems-public/php-fpm:8.2-prod
+docker pull registry.nimahosts.com/nimasystems-public/php:7.3-apache   # replaces FROM php:7.3-apache
 ```
 
-Each is a drop-in replacement for the matching `devilbox/php-fpm` image: the upstream image (pinned by digest) is
+Each is a drop-in replacement for the matching upstream image: the upstream image (pinned by digest) is
 kept as is, only the PHP binaries, headers and bundled shared modules (`opcache`, `sodium`) are replaced, and
 `/usr/src/php.tar.xz` holds the patched sources (8.2: the 8.2.35 release) so `docker-php-ext-install` builds
 against them. The build fails if the fixed PHP is not active.
@@ -49,14 +54,15 @@ Limitations:
 
 ### Build and release
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) builds all PHP versions for `linux/amd64` and
+[`.github/workflows/build.yml`](.github/workflows/build.yml) builds all images for `linux/amd64` and
 `linux/arm64` on native runners, pushes to `registry.nimahosts.com`, sends a Slack notification per image and
 creates a GitHub release.
 
 ```bash
-git tag v1.2.0
-git push origin v1.2.0
-# -> registry.nimahosts.com/nimasystems-public/php-fpm:{7.3,7.4,8.2}-prod-1.2.0 and :{7.3,7.4,8.2}-prod
+git tag v1.3.0
+git push origin v1.3.0
+# -> registry.nimahosts.com/nimasystems-public/php-fpm:{7.3,7.4,8.2}-prod-1.3.0 and :{7.3,7.4,8.2}-prod
+#    registry.nimahosts.com/nimasystems-public/php:7.3-apache-1.3.0 and :7.3-apache
 ```
 
 Or run the workflow manually (Actions -> build -> Run workflow) with a version.

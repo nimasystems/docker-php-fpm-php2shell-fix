@@ -1,0 +1,120 @@
+# vi: ft=dockerfile
+#
+# Official php:7.3-apache (mod_php) with PHP rebuilt from patched sources to
+# fix PHP2Shell (CVE-2026-109618 / CVE-2026-109619).
+#
+# PHP 7.3 is EOL and gets no upstream release with the fix, so PHP 7.3.33 is
+# recompiled in place with the official PHP 7.4 source backport ported to 7.3
+# (see ./patches/7.3, same patch as the 7.3-prod image). Both the Apache
+# module (libphp7.so) and the CLI are replaced; everything else is kept as is.
+
+# Official php:7.3-apache (last built 2022-03-17), pinned by digest
+ARG BASE_IMAGE=php:7.3-apache@sha256:b9872cd287ef72bc17d45d713aa2742f3d3bcf2503fea2506fd93aa94995219f
+
+
+###
+### Build patched PHP
+###
+FROM ${BASE_IMAGE} AS builder
+
+COPY ./patches/7.3/ /usr/src/php-patches/
+
+# Bullseye is EOL and its mirrors no longer serve the old pool, so take the
+# headers from snapshot.debian.org at the date the base image was built
+# (2022-03). Every -dev package is pinned to the version of the runtime library
+# installed in the image, so PHP links against exactly what ships.
+RUN set -eux \
+	&& { \
+		for s in 20220316T000000Z; do \
+			echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${s} bullseye main"; \
+			echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${s} bullseye-updates main"; \
+			echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${s} bullseye-security main"; \
+		done; \
+	} > /etc/apt/sources.list \
+	&& rm -f /etc/apt/sources.list.d/*.list \
+	&& DEV_PKGS="" \
+	&& for pair in \
+		apache2-dev:apache2-bin \
+		libargon2-dev:libargon2-1 \
+		libcurl4-openssl-dev:libcurl4 \
+		libreadline-dev:libreadline8 \
+		libsodium-dev:libsodium23 \
+		libsqlite3-dev:libsqlite3-0 \
+		libssl-dev:libssl1.1 \
+		libxml2-dev:libxml2 \
+		zlib1g-dev:zlib1g \
+	; do \
+		DEV_PKGS="${DEV_PKGS} ${pair%%:*}=$( dpkg-query -W -f='${Version}' "${pair#*:}" )"; \
+	done \
+	&& DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 update \
+	&& DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends --no-install-suggests --no-upgrade \
+		${PHPIZE_DEPS} \
+		patch \
+		xz-utils \
+		${DEV_PKGS} \
+	\
+# Unpack the pristine sources shipped with the image and patch them
+	&& PHP_SRC_VERSION="$( php -r 'echo PHP_VERSION;' )" \
+	&& mkdir -p "/usr/src/php-${PHP_SRC_VERSION}" \
+	&& tar -Jxf /usr/src/php.tar.xz -C "/usr/src/php-${PHP_SRC_VERSION}" --strip-components=1 \
+	&& cd "/usr/src/php-${PHP_SRC_VERSION}" \
+	&& for p in /usr/src/php-patches/*.patch; do patch -p1 --forward --fuzz=0 < "${p}"; done \
+	\
+# Repack, so docker-php-ext-install builds against the patched sources too
+	&& tar -C /usr/src -cJf /usr/src/php-patched.tar.xz "php-${PHP_SRC_VERSION}" \
+	\
+# Configure exactly like the original build
+	&& export CFLAGS="${PHP_CFLAGS}" CPPFLAGS="${PHP_CPPFLAGS}" LDFLAGS="${PHP_LDFLAGS}" \
+	&& ./configure $( php-config --configure-options ) \
+	&& make -j"$( nproc )" \
+	&& find . -type f -name '*.a' -delete \
+	\
+# Install everything except PEAR (keeps the pecl registry of the image intact)
+	&& INSTALL_TARGETS="$( sed -n 's/^install_targets = //p' Makefile | sed 's/install-pear//' )" \
+# apxs writes php7.load there; the base image already has it, so it is dropped below
+	&& mkdir -p /php-install/etc/apache2/mods-available \
+	&& make INSTALL_ROOT=/php-install ${INSTALL_TARGETS} \
+	&& rm -rf /php-install/etc /php-install/usr/local/etc /php-install/usr/local/php/man \
+	&& find /php-install/usr/local -type f -exec sh -c 'file -b "$1" | grep -q "^ELF" && strip --strip-all "$1" || true' _ '{}' \; \
+	&& test -x /php-install/usr/local/bin/php \
+	&& test -f /php-install/usr/lib/apache2/modules/libphp7.so
+
+
+###
+### Final image
+###
+FROM ${BASE_IMAGE}
+
+LABEL "org.opencontainers.image.url"="https://github.com/nimasystems/docker-php-fpm-php2shell-fix"
+LABEL "org.opencontainers.image.source"="https://github.com/nimasystems/docker-php-fpm-php2shell-fix"
+LABEL "org.opencontainers.image.vendor"="nimasystems"
+LABEL "org.opencontainers.image.ref.name"="7.3-apache"
+LABEL "org.opencontainers.image.title"="PHP 7.3-apache (PHP2Shell fix)"
+LABEL "org.opencontainers.image.description"="php:7.3-apache with PHP 7.3.33 patched for CVE-2026-109618 and CVE-2026-109619"
+
+COPY --from=builder /php-install/usr/local/ /usr/local/
+COPY --from=builder /php-install/usr/lib/apache2/modules/libphp7.so /usr/lib/apache2/modules/libphp7.so
+COPY --from=builder /usr/src/php-patched.tar.xz /usr/src/php.tar.xz
+COPY --from=builder /usr/src/php-patches/ /usr/src/php-patches/
+COPY ./data/php-ini.d/php2shell.ini /usr/local/etc/php/conf.d/xxx-php2shell.ini
+
+###
+### Verify
+###
+RUN set -eux \
+# The signature belongs to the unpatched tarball
+	&& rm -f /usr/src/php.tar.xz.asc \
+	\
+# max_multipart_body_parts only exists in the patched build
+	&& php -r 'exit(ini_get("max_multipart_body_parts") === "-1" ? 0 : 1);' \
+	&& php -r 'exit(ini_get("session.upload_progress.enabled") ? 1 : 0);' \
+	&& php -v | grep -oE 'PHP\s[.0-9]+' | grep -oE '[.0-9]+' | grep '^7.3' \
+	\
+# the Apache module must be the patched build too
+	&& grep -aq max_multipart_body_parts /usr/lib/apache2/modules/libphp7.so \
+	&& apache2ctl -t \
+	&& apache2ctl -M 2>/dev/null | grep -q php7_module \
+	&& PHP_ERROR="$( php -v 2>&1 1>/dev/null )" \
+	&& if [ -n "${PHP_ERROR}" ]; then echo "${PHP_ERROR}"; false; fi \
+	&& PHP_ERROR="$( php -i 2>&1 1>/dev/null )" \
+	&& if [ -n "${PHP_ERROR}" ]; then echo "${PHP_ERROR}"; false; fi

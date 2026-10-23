@@ -11,7 +11,7 @@ on:
       - "v*.*.*"
 
 env:
-  IMAGE: registry.nimahosts.com/nimasystems-public/php-fpm
+  REGISTRY_NS: registry.nimahosts.com/nimasystems-public
 
 jobs:
   set-version:
@@ -43,19 +43,32 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        php: [ "7.3", "7.4", "8.2" ]
+        variant: [ "7.3-prod", "7.4-prod", "8.2-prod", "7.3-apache" ]
         platform: [ linux/amd64, linux/arm64 ]
         include:
           - platform: linux/amd64
             runner: ubuntu-24.04
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+          - variant: "7.3-prod"
+            image: php-fpm
+            dockerfile: Dockerfile-7.3
+          - variant: "7.4-prod"
+            image: php-fpm
+            dockerfile: Dockerfile-7.4
+          - variant: "8.2-prod"
+            image: php-fpm
+            dockerfile: Dockerfile-8.2
+          - variant: "7.3-apache"
+            image: php
+            dockerfile: Dockerfile-7.3-apache
     runs-on: ${{ matrix.runner }}
     env:
-      PHP_VERSION: ${{ matrix.php }}
+      IMAGE: ${{ format('registry.nimahosts.com/nimasystems-public/{0}', matrix.image) }}
+      VARIANT: ${{ matrix.variant }}
     steps:
       - name: Prepare
-        run: echo "PLATFORM_PAIR=${{ matrix.php }}-${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_ENV"
+        run: echo "PLATFORM_PAIR=${{ matrix.variant }}-${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -75,13 +88,13 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: Dockerfiles/php2shell
-          file: Dockerfiles/php2shell/Dockerfile-${{ env.PHP_VERSION }}
+          file: Dockerfiles/php2shell/${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
           pull: true
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
           labels: |
-            org.opencontainers.image.version=${{ env.PHP_VERSION }}-prod-${{ needs.set-version.outputs.version }}
+            org.opencontainers.image.version=${{ env.VARIANT }}-${{ needs.set-version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
@@ -106,9 +119,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: [ "7.3", "7.4", "8.2" ]
+        variant: [ "7.3-prod", "7.4-prod", "8.2-prod", "7.3-apache" ]
+        include:
+          - variant: "7.3-prod"
+            image: php-fpm
+          - variant: "7.4-prod"
+            image: php-fpm
+          - variant: "8.2-prod"
+            image: php-fpm
+          - variant: "7.3-apache"
+            image: php
     env:
-      PHP_VERSION: ${{ matrix.php }}
+      IMAGE: ${{ format('registry.nimahosts.com/nimasystems-public/{0}', matrix.image) }}
+      VARIANT: ${{ matrix.variant }}
       VERSION: ${{ needs.set-version.outputs.version }}
     steps:
       - name: Check platform builds
@@ -121,7 +144,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: /tmp/digests
-          pattern: digests-${{ matrix.php }}-*
+          pattern: digests-${{ matrix.variant }}-linux-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -138,16 +161,16 @@ jobs:
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create \
-            -t "${IMAGE}:${PHP_VERSION}-prod-${VERSION}" \
-            -t "${IMAGE}:${PHP_VERSION}-prod" \
+            -t "${IMAGE}:${VARIANT}-${VERSION}" \
+            -t "${IMAGE}:${VARIANT}" \
             $(printf "${IMAGE}@sha256:%s " *)
 
       - name: Inspect image
-        run: docker buildx imagetools inspect "${IMAGE}:${PHP_VERSION}-prod-${VERSION}"
+        run: docker buildx imagetools inspect "${IMAGE}:${VARIANT}-${VERSION}"
 
       - name: Verify patched PHP
         run: |
-          docker run --rm --entrypoint php "${IMAGE}:${PHP_VERSION}-prod-${VERSION}" \
+          docker run --rm --entrypoint php "${IMAGE}:${VARIANT}-${VERSION}" \
             -r 'echo PHP_VERSION, " max_multipart_body_parts=", var_export(ini_get("max_multipart_body_parts"), true), "\n"; exit(ini_get("max_multipart_body_parts") === "-1" ? 0 : 1);'
 
       - name: Send Slack Notification
@@ -159,17 +182,17 @@ jobs:
           payload: |
             channel: notifications
             status: "${{ job.status }}"
-            text: "*✅ Deployment of PHP-FPM ${{ env.PHP_VERSION }}-prod PHP2Shell fix (${{ env.VERSION }}) completed successfully.*\n
+            text: "*✅ Deployment of ${{ env.VARIANT }} PHP2Shell fix (${{ env.VERSION }}) completed successfully.*\n
             *Status:* ${{ job.status }}\n
-            *Image:* ${{ env.IMAGE }}:${{ env.PHP_VERSION }}-prod-${{ env.VERSION }}\n
+            *Image:* ${{ env.IMAGE }}:${{ env.VARIANT }}-${{ env.VERSION }}\n
             *Build URL:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Build>"
             blocks:
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "✅ Deployment of PHP-FPM ${{ env.PHP_VERSION }}-prod PHP2Shell fix (${{ env.VERSION }}) completed successfully.\n
+                  text: "✅ Deployment of ${{ env.VARIANT }} PHP2Shell fix (${{ env.VERSION }}) completed successfully.\n
                   *Status:* ${{ job.status }}\n
-                  *Image:* ${{ env.IMAGE }}:${{ env.PHP_VERSION }}-prod-${{ env.VERSION }}\n
+                  *Image:* ${{ env.IMAGE }}:${{ env.VARIANT }}-${{ env.VERSION }}\n
                   *Build URL:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Build>"
 
       - name: Send Slack Notification
@@ -181,7 +204,7 @@ jobs:
           payload: |
             channel: notifications
             status: "${{ job.status }}"
-            text: "*❌ Deployment of PHP-FPM ${{ env.PHP_VERSION }}-prod PHP2Shell fix (${{ env.VERSION }}) DID NOT complete successfully.*\n
+            text: "*❌ Deployment of ${{ env.VARIANT }} PHP2Shell fix (${{ env.VERSION }}) DID NOT complete successfully.*\n
             *Status:* ${{ job.status }}\n
             *Version which failed:* ${{ env.VERSION }}\n
             *Build URL:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Build>"
@@ -189,7 +212,7 @@ jobs:
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "❌ Deployment of PHP-FPM ${{ env.PHP_VERSION }}-prod PHP2Shell fix (${{ env.VERSION }}) DID NOT complete successfully.\n
+                  text: "❌ Deployment of ${{ env.VARIANT }} PHP2Shell fix (${{ env.VERSION }}) DID NOT complete successfully.\n
                   *Status:* ${{ job.status }}\n
                   *Version which failed:* ${{ env.VERSION }}\n
                   *Build URL:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Build>"
@@ -241,10 +264,11 @@ jobs:
           tag_name: v${{ needs.set-version.outputs.version }}
           name: Release ${{ needs.set-version.outputs.version }}
           body: |
-            ## PHP-FPM 7.3-prod / 7.4-prod / 8.2-prod (PHP2Shell fix) Release ${{ needs.set-version.outputs.version }}
+            ## PHP2Shell fix images, release ${{ needs.set-version.outputs.version }}
 
-            `devilbox/php-fpm` 7.3-prod and 7.4-prod with PHP rebuilt from patched sources, and 8.2-prod
-            upgraded to PHP 8.2.35, to fix CVE-2026-109618 and CVE-2026-109619 (PHP2Shell).
+            `devilbox/php-fpm` 7.3-prod and 7.4-prod and the official `php:7.3-apache` with PHP rebuilt from
+            patched sources, and `devilbox/php-fpm` 8.2-prod upgraded to PHP 8.2.35, to fix CVE-2026-109618
+            and CVE-2026-109619 (PHP2Shell).
 
             **Platforms:** Docker (linux/amd64, linux/arm64)
 
@@ -252,9 +276,10 @@ jobs:
             ${{ steps.changelog.outputs.content }}
 
             ### Docker Images
-            - `${{ env.IMAGE }}:7.3-prod-${{ needs.set-version.outputs.version }}` / `${{ env.IMAGE }}:7.3-prod`
-            - `${{ env.IMAGE }}:7.4-prod-${{ needs.set-version.outputs.version }}` / `${{ env.IMAGE }}:7.4-prod`
-            - `${{ env.IMAGE }}:8.2-prod-${{ needs.set-version.outputs.version }}` / `${{ env.IMAGE }}:8.2-prod`
+            - `${{ env.REGISTRY_NS }}/php-fpm:7.3-prod-${{ needs.set-version.outputs.version }}` / `${{ env.REGISTRY_NS }}/php-fpm:7.3-prod`
+            - `${{ env.REGISTRY_NS }}/php-fpm:7.4-prod-${{ needs.set-version.outputs.version }}` / `${{ env.REGISTRY_NS }}/php-fpm:7.4-prod`
+            - `${{ env.REGISTRY_NS }}/php-fpm:8.2-prod-${{ needs.set-version.outputs.version }}` / `${{ env.REGISTRY_NS }}/php-fpm:8.2-prod`
+            - `${{ env.REGISTRY_NS }}/php:7.3-apache-${{ needs.set-version.outputs.version }}` / `${{ env.REGISTRY_NS }}/php:7.3-apache`
 
             ### Deployment
             This release has been automatically built and pushed to the Docker registry.
