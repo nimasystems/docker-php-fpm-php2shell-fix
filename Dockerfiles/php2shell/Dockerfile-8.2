@@ -1,0 +1,123 @@
+# vi: ft=dockerfile
+#
+# devilbox/php-fpm:8.2-prod with PHP upgraded to fix PHP2Shell
+# (CVE-2026-109618 / CVE-2026-109619).
+#
+# The upstream image ships PHP 8.2.1. PHP 8.2 is still supported and 8.2.35 is
+# the official release with the fix, so PHP is recompiled in place from the
+# 8.2.35 release tarball (same extension API, so the PECL extensions of the
+# image keep working). Everything else in the upstream image (extensions,
+# tools, entrypoint, supervisor) is kept as is.
+
+# Upstream devilbox/php-fpm:8.2-prod (last built 2023-01-30), pinned by digest
+ARG BASE_IMAGE=devilbox/php-fpm:8.2-prod@sha256:49f6e8a8f3917e12d89b6da3e80cfe277ff8a16dc71ff81593925381a58175fd
+# 8.2.35 fixes CVE-2026-109618 / CVE-2026-109619; checksum from php.net
+ARG PHP_RELEASE=8.2.35
+ARG PHP_SHA256=5737b98601fe5ab1b8c5db0c82ed3158acb9283ed3081ffe2faffb9ac81455e6
+
+
+###
+### Build PHP 8.2.35
+###
+FROM ${BASE_IMAGE} AS builder
+
+ARG PHP_RELEASE
+ARG PHP_SHA256
+
+# Bullseye is EOL and its mirrors no longer serve the old pool, so take the
+# headers from snapshot.debian.org: the base image (2023-01-09) and the devilbox
+# build (2023-01). Every -dev package is pinned to the version of the runtime
+# library installed in the image, so PHP links against exactly what ships.
+RUN set -eux \
+	&& { \
+		for s in 20230109T000000Z 20230130T000000Z; do \
+			echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${s} bullseye main"; \
+			echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${s} bullseye-updates main"; \
+			echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${s} bullseye-security main"; \
+		done; \
+	} > /etc/apt/sources.list \
+	&& rm -f /etc/apt/sources.list.d/*.list \
+	&& DEV_PKGS="" \
+	&& for pair in \
+		libargon2-dev:libargon2-1 \
+		libcurl4-openssl-dev:libcurl4 \
+		libedit-dev:libedit2 \
+		libffi-dev:libffi7 \
+		libonig-dev:libonig5 \
+		libreadline-dev:libreadline8 \
+		libsodium-dev:libsodium23 \
+		libsqlite3-dev:libsqlite3-0 \
+		libssl-dev:libssl1.1 \
+		libxml2-dev:libxml2 \
+		zlib1g-dev:zlib1g \
+	; do \
+		DEV_PKGS="${DEV_PKGS} ${pair%%:*}=$( dpkg-query -W -f='${Version}' "${pair#*:}" )"; \
+	done \
+	&& DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 update \
+	&& DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends --no-install-suggests --no-upgrade \
+		${PHPIZE_DEPS} \
+		ca-certificates \
+		curl \
+		xz-utils \
+		${DEV_PKGS} \
+	\
+# Fetch and verify the official release
+	&& curl -fsSL --retry 5 -o /usr/src/php-release.tar.xz "https://www.php.net/distributions/php-${PHP_RELEASE}.tar.xz" \
+	&& echo "${PHP_SHA256} */usr/src/php-release.tar.xz" | sha256sum -c - \
+	&& mkdir -p "/usr/src/php-${PHP_RELEASE}" \
+	&& tar -Jxf /usr/src/php-release.tar.xz -C "/usr/src/php-${PHP_RELEASE}" --strip-components=1 \
+	&& cd "/usr/src/php-${PHP_RELEASE}" \
+	\
+# Configure exactly like the original build
+	&& export CFLAGS="${PHP_CFLAGS}" CPPFLAGS="${PHP_CPPFLAGS}" LDFLAGS="${PHP_LDFLAGS}" \
+	&& ./configure $( php-config --configure-options ) \
+	&& make -j"$( nproc )" \
+	&& find . -type f -name '*.a' -delete \
+	\
+# Install everything except PEAR (keeps the pecl registry of the image intact)
+	&& INSTALL_TARGETS="$( sed -n 's/^install_targets = //p' Makefile | sed 's/install-pear//' )" \
+	&& make INSTALL_ROOT=/php-install ${INSTALL_TARGETS} \
+	&& rm -rf /php-install/usr/local/etc /php-install/usr/local/php/man \
+	&& find /php-install/usr/local -type f -exec sh -c 'file -b "$1" | grep -q "^ELF" && strip --strip-all "$1" || true' _ '{}' \; \
+	&& test -x /php-install/usr/local/bin/php \
+	&& test -x /php-install/usr/local/sbin/php-fpm
+
+
+###
+### Final image
+###
+FROM ${BASE_IMAGE}
+
+LABEL "org.opencontainers.image.url"="https://github.com/nimasystems/docker-php-fpm-php2shell-fix"
+LABEL "org.opencontainers.image.source"="https://github.com/nimasystems/docker-php-fpm-php2shell-fix"
+LABEL "org.opencontainers.image.vendor"="nimasystems"
+LABEL "org.opencontainers.image.ref.name"="8.2-prod"
+LABEL "org.opencontainers.image.title"="PHP-FPM 8.2-prod (PHP2Shell fix)"
+LABEL "org.opencontainers.image.description"="devilbox/php-fpm:8.2-prod with PHP upgraded to 8.2.35 for CVE-2026-109618 and CVE-2026-109619"
+
+COPY --from=builder /php-install/usr/local/ /usr/local/
+COPY --from=builder /usr/src/php-release.tar.xz /usr/src/php.tar.xz
+COPY ./data/php-ini.d/php2shell.ini /usr/local/etc/php/conf.d/xxx-php2shell.ini
+
+###
+### Verify
+###
+ARG PHP_RELEASE
+
+RUN set -eux \
+# CLI and FPM must both run the fixed release
+	&& php -r 'exit(PHP_VERSION === $argv[1] ? 0 : 1);' "${PHP_RELEASE}" \
+	&& php-fpm -v | grep -q "^PHP ${PHP_RELEASE} " \
+	&& php -r 'exit(ini_get("session.upload_progress.enabled") ? 1 : 0);' \
+	\
+	&& echo "date.timezone=UTC" > /usr/local/etc/php/php.ini \
+	&& /usr/local/sbin/php-fpm --test \
+	&& PHP_ERROR="$( php -v 2>&1 1>/dev/null )" \
+	&& if [ -n "${PHP_ERROR}" ]; then echo "${PHP_ERROR}"; false; fi \
+	&& PHP_ERROR="$( php -i 2>&1 1>/dev/null )" \
+	&& if [ -n "${PHP_ERROR}" ]; then echo "${PHP_ERROR}"; false; fi \
+	&& PHP_FPM_ERROR="$( php-fpm -v 2>&1 1>/dev/null )" \
+	&& if [ -n "${PHP_FPM_ERROR}" ]; then echo "${PHP_FPM_ERROR}"; false; fi \
+	&& PHP_FPM_ERROR="$( php-fpm -i 2>&1 1>/dev/null )" \
+	&& if [ -n "${PHP_FPM_ERROR}" ]; then echo "${PHP_FPM_ERROR}"; false; fi \
+	&& rm -f /usr/local/etc/php/php.ini

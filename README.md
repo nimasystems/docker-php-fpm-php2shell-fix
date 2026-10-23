@@ -1,27 +1,28 @@
-# PHP-FPM 7.3-prod / 7.4-prod with the PHP2Shell fix (nimasystems fork)
+# PHP-FPM 7.3-prod / 7.4-prod / 8.2-prod with the PHP2Shell fix (nimasystems fork)
 
-This fork publishes `devilbox/php-fpm:7.3-prod` and `devilbox/php-fpm:7.4-prod` with PHP rebuilt from patched
-sources to fix **PHP2Shell**: [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
+This fork publishes `devilbox/php-fpm` 7.3-prod, 7.4-prod and 8.2-prod with PHP rebuilt to fix **PHP2Shell**: [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
 (RCE via OOM corruption) and [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
 (RCE via stale global state), both CVSS 9.2.
 
-PHP 7.3 and 7.4 are end of life and have no official release with the fix. The PHP security team published a
-minimal source backport for EOL branches ([`PHP-7.4-CVE-2026-109618-109619`](https://github.com/php/php-src/tree/PHP-7.4-CVE-2026-109618-109619),
+PHP 8.2 got an official release with the fix (8.2.35), so the 8.2 image is simply upgraded from the PHP 8.2.1
+it shipped with. PHP 7.3 and 7.4 are end of life and have no official release with the fix. The PHP security team
+published a minimal source backport for EOL branches ([`PHP-7.4-CVE-2026-109618-109619`](https://github.com/php/php-src/tree/PHP-7.4-CVE-2026-109618-109619),
 commit `712e60f9edfd`):
 
 | Image      | PHP    | Patch |
 |------------|--------|-------|
 | `7.4-prod` | 7.4.33 | [official backport, unmodified](Dockerfiles/php2shell/patches/7.4/) |
 | `7.3-prod` | 7.3.33 | [official backport ported to 7.3](Dockerfiles/php2shell/patches/7.3/) (differences listed in the patch header) |
+| `8.2-prod` | 8.2.35 | official release (upgraded from 8.2.1), checksum pinned in [`Dockerfile-8.2`](Dockerfiles/php2shell/Dockerfile-8.2) |
 
-The patch:
+The 7.3 / 7.4 patch (8.2.35 contains the complete upstream fix, which handles OOM gracefully instead):
 
 - replaces the `longjmp()` bailout on memory-limit / allocation-overflow errors with an immediate `_exit()` of the worker, so request shutdown never runs on half-initialized state
 - resets error, exception, object-store, HTTP globals, SAPI and session state at request shutdown so nothing stale is visible to the next request
 - limits multipart parsing (`max_multipart_body_parts`, default `max_input_vars + max_file_uploads`; only `Content-Disposition`/`Content-Type` part headers are kept)
 - disables the session upload progress hook (`session.upload_progress.enabled` is also set to `Off`)
 
-Behavior change: a request that hits `memory_limit` now terminates its FPM worker (the master spawns a new one).
+Behavior change (7.3 / 7.4 only): a request that hits `memory_limit` now terminates its FPM worker (the master spawns a new one).
 The `Fatal error: Allowed memory size ... exhausted` message is written to the worker's stderr (it shows up in the
 FPM log) instead of going through the PHP error handlers, and the web server answers with a 502 instead of a 500.
 
@@ -30,27 +31,32 @@ FPM log) instead of going through the PHP error handlers, and the web server ans
 ```bash
 docker pull registry.nimahosts.com/nimasystems-public/php-fpm:7.3-prod
 docker pull registry.nimahosts.com/nimasystems-public/php-fpm:7.4-prod
+docker pull registry.nimahosts.com/nimasystems-public/php-fpm:8.2-prod
 ```
 
 Each is a drop-in replacement for the matching `devilbox/php-fpm` image: the upstream image (pinned by digest) is
 kept as is, only the PHP binaries, headers and bundled shared modules (`opcache`, `sodium`) are replaced, and
-`/usr/src/php.tar.xz` holds the patched sources so `docker-php-ext-install` builds against them.
-The build fails if the patched PHP is not active.
+`/usr/src/php.tar.xz` holds the patched sources (8.2: the 8.2.35 release) so `docker-php-ext-install` builds
+against them. The build fails if the fixed PHP is not active.
 
-Limitation: PECL and other extensions in the upstream images were compiled against the unpatched headers and are not
-rebuilt. The fix itself is in the PHP core binaries; only the overflow checks that PHP's headers inline into those
-extensions keep the old behavior.
+Limitations:
+
+- PECL and other extensions in the upstream images were compiled against the unpatched headers and are not
+  rebuilt. The fix itself is in the PHP core binaries; only the overflow checks that PHP's headers inline into those
+  extensions keep the old behavior.
+- 8.2: the bundled extensions that devilbox built as shared modules (gd, intl, soap, mysqli, pdo_*, zip, ...) are
+  still the 8.2.1 builds (`phpversion('intl')` reports 8.2.1); only the core, `opcache` and `sodium` are 8.2.35.
 
 ### Build and release
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) builds both PHP versions for `linux/amd64` and
+[`.github/workflows/build.yml`](.github/workflows/build.yml) builds all PHP versions for `linux/amd64` and
 `linux/arm64` on native runners, pushes to `registry.nimahosts.com`, sends a Slack notification per image and
 creates a GitHub release.
 
 ```bash
-git tag v1.1.0
-git push origin v1.1.0
-# -> registry.nimahosts.com/nimasystems-public/php-fpm:7.3-prod-1.1.0, :7.3-prod, :7.4-prod-1.1.0 and :7.4-prod
+git tag v1.2.0
+git push origin v1.2.0
+# -> registry.nimahosts.com/nimasystems-public/php-fpm:{7.3,7.4,8.2}-prod-1.2.0 and :{7.3,7.4,8.2}-prod
 ```
 
 Or run the workflow manually (Actions -> build -> Run workflow) with a version.
