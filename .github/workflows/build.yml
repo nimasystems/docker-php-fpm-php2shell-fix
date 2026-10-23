@@ -1,0 +1,256 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version number (e.g., 1.0.0)"
+        required: true
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  IMAGE: registry.nimahosts.com/nimasystems-public/php-fpm
+  PHP_VERSION: "7.3"
+
+jobs:
+  set-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract_version.outputs.version }}
+    steps:
+      - name: Extract version from tag
+        id: extract_version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=$INPUT_VERSION
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version: $VERSION"
+            exit 1
+          fi
+          echo "Extracted version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # PHP is compiled from source, so each platform builds on a native runner
+  # (no QEMU) and pushes by digest; merge-push stitches the manifest list.
+  build:
+    needs: [ set-version ]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Prepare
+        run: echo "PLATFORM_PAIR=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.nimahosts.com
+          username: ${{ secrets.REGISTRY_NIMAHOSTS_USERNAME }}
+          password: ${{ secrets.REGISTRY_NIMAHOSTS_PASSWORD }}
+
+      - name: Build and push by digest
+        id: docker_build
+        uses: docker/build-push-action@v6
+        with:
+          context: Dockerfiles/php2shell
+          file: Dockerfiles/php2shell/Dockerfile-${{ env.PHP_VERSION }}
+          platforms: ${{ matrix.platform }}
+          pull: true
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+          labels: |
+            org.opencontainers.image.version=${{ env.PHP_VERSION }}-prod-${{ needs.set-version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.docker_build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-push:
+    runs-on: ubuntu-latest
+    needs: [ set-version, build ]
+    if: ${{ !cancelled() }}
+    outputs:
+      version: ${{ needs.set-version.outputs.version }}
+    env:
+      VERSION: ${{ needs.set-version.outputs.version }}
+    steps:
+      - name: Check platform builds
+        if: ${{ needs.build.result != 'success' }}
+        run: |
+          echo "Platform builds finished with: ${{ needs.build.result }}"
+          exit 1
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.nimahosts.com
+          username: ${{ secrets.REGISTRY_NIMAHOSTS_USERNAME }}
+          password: ${{ secrets.REGISTRY_NIMAHOSTS_PASSWORD }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:${PHP_VERSION}-prod-${VERSION}" \
+            -t "${IMAGE}:${PHP_VERSION}-prod" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect "${IMAGE}:${PHP_VERSION}-prod-${VERSION}"
+
+      - name: Verify patched PHP
+        run: |
+          docker run --rm --entrypoint php "${IMAGE}:${PHP_VERSION}-prod-${VERSION}" \
+            -r 'echo PHP_VERSION, " max_multipart_body_parts=", var_export(ini_get("max_multipart_body_parts"), true), "\n"; exit(ini_get("max_multipart_body_parts") === "-1" ? 0 : 1);'
+
+      - name: Send Slack Notification
+        if: ${{ env.ACT != 'true' && success() }}
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            channel: notifications
+            status: "${{ job.status }}"
+            text: "*✅ Deployment of PHP-FPM ${{ env.PHP_VERSION }}-prod PHP2Shell fix (${{ env.VERSION }}) completed successfully.*\n
+            *Status:* ${{ job.status }}\n
+            *Image:* ${{ env.IMAGE }}:${{ env.PHP_VERSION }}-prod-${{ env.VERSION }}\n
+            *Build URL:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Build>"
+            blocks:
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "✅ Deployment of PHP-FPM ${{ env.PHP_VERSION }}-prod PHP2Shell fix (${{ env.VERSION }}) completed successfully.\n
+                  *Status:* ${{ job.status }}\n
+                  *Image:* ${{ env.IMAGE }}:${{ env.PHP_VERSION }}-prod-${{ env.VERSION }}\n
+                  *Build URL:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Build>"
+
+      - name: Send Slack Notification
+        if: ${{ env.ACT != 'true' && failure() }}
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            channel: notifications
+            status: "${{ job.status }}"
+            text: "*❌ Deployment of PHP-FPM ${{ env.PHP_VERSION }}-prod PHP2Shell fix (${{ env.VERSION }}) DID NOT complete successfully.*\n
+            *Status:* ${{ job.status }}\n
+            *Version which failed:* ${{ env.VERSION }}\n
+            *Build URL:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Build>"
+            blocks:
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "❌ Deployment of PHP-FPM ${{ env.PHP_VERSION }}-prod PHP2Shell fix (${{ env.VERSION }}) DID NOT complete successfully.\n
+                  *Status:* ${{ job.status }}\n
+                  *Version which failed:* ${{ env.VERSION }}\n
+                  *Build URL:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Build>"
+
+  create-release:
+    needs: [ merge-push ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.merge-push.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get previous tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 v${{ needs.merge-push.outputs.version }}^ 2>/dev/null || echo "")
+
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "No previous tag found, using the last 20 commits"
+            CHANGELOG=$(git log -n 20 --pretty=format:"- %s (%h)" v${{ needs.merge-push.outputs.version }})
+          else
+            echo "Previous tag: $PREVIOUS_TAG"
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" ${PREVIOUS_TAG}..v${{ needs.merge-push.outputs.version }})
+          fi
+
+          # Save changelog to file for multiline output
+          echo "$CHANGELOG" > changelog.txt
+
+          # Output for step output
+          {
+            echo "content<<EOF"
+            cat changelog.txt
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+          # Also output for debugging
+          echo "Changelog:"
+          cat changelog.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: v${{ needs.merge-push.outputs.version }}
+          name: Release ${{ needs.merge-push.outputs.version }}
+          body: |
+            ## PHP-FPM ${{ env.PHP_VERSION }}-prod (PHP2Shell fix) Release ${{ needs.merge-push.outputs.version }}
+
+            `devilbox/php-fpm:${{ env.PHP_VERSION }}-prod` with PHP rebuilt from patched sources to fix
+            CVE-2026-109618 and CVE-2026-109619 (PHP2Shell).
+
+            **Platforms:** Docker (linux/amd64, linux/arm64)
+
+            ### Changes
+            ${{ steps.changelog.outputs.content }}
+
+            ### Docker Images
+            - `${{ env.IMAGE }}:${{ env.PHP_VERSION }}-prod-${{ needs.merge-push.outputs.version }}`
+            - `${{ env.IMAGE }}:${{ env.PHP_VERSION }}-prod`
+
+            ### Deployment
+            This release has been automatically built and pushed to the Docker registry.
+
+            ---
+            *🤖 Auto-generated release from [GitHub Actions](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*
